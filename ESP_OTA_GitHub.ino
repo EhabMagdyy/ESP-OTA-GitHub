@@ -13,7 +13,6 @@
 #include <ESP8266HTTPClient.h>
 #include <Updater.h>
 #include <LittleFS.h>
-#include <FS.h>
 // File path to save the downloaded file
 #define SPIFFS_FilePath           "/update.bin"
 #endif
@@ -194,7 +193,7 @@ void ESP32UpdateFirwmare(String updateFileUrl)
 void ESP8266UpdateFirwmare(String updateFileUrl)
 {
     const size_t chunkSize = 16384; // 16KB chunks
-    const int maxRetries = 3;       // Max retries per chunk (if errors happens)
+    const int maxRetries = 3;       // Max retries per chunk
     HTTPClient http;
     WiFiClientSecure client;
 
@@ -241,12 +240,12 @@ void ESP8266UpdateFirwmare(String updateFileUrl)
     // Download file in chunks
     Serial.printf("Free heap before download: %d bytes\n", ESP.getFreeHeap());
     Serial.println("Downloading update file...");
-    size_t start = 0;
-    while (start < totalSize) {
-        size_t end = start + chunkSize - 1;
+    size_t position = 0;
+    while (position < totalSize) {
+        size_t end = position + chunkSize - 1;
         if (end >= totalSize) end = totalSize - 1;
-        String range = "bytes=" + String(start) + "-" + String(end);
-        size_t expected = end - start + 1;
+        String range = "bytes=" + String(position) + "-" + String(end);
+        size_t expected = end - position + 1;
 
         bool success = false;
         for (int retry = 0; retry < maxRetries; retry++) {
@@ -257,16 +256,35 @@ void ESP8266UpdateFirwmare(String updateFileUrl)
             httpCode = http.GET();
 
             if (httpCode == HTTP_CODE_PARTIAL_CONTENT) {
-                int bytesWritten = http.writeToStream(&file);
-                if (bytesWritten > 0 && bytesWritten == expected) {
-                    start += bytesWritten;
-                    Serial.printf("Downloaded chunk %d-%d, written %d bytes (%.1f%%)\n", 
-                                  start - bytesWritten, end, bytesWritten, (start * 100.0) / totalSize);
+                WiFiClient& stream = http.getStream();
+                size_t bytesRead = 0;
+                uint8_t buffer[256]; // Small buffer to manage memory
+                while (bytesRead < expected && stream.connected()) {
+                    size_t available = stream.available();
+                    if (available) {
+                        size_t toRead = min(sizeof(buffer), available);
+                        size_t readNow = stream.readBytes(buffer, toRead);
+                        if (readNow > 0) {
+                            file.seek(position + bytesRead);
+                            size_t written = file.write(buffer, readNow);
+                            if (written != readNow) {
+                                Serial.println("Write error: failed to write to file");
+                                break;
+                            }
+                            bytesRead += written;
+                        }
+                    }
+                    delay(1); // Yield to avoid watchdog timeout
+                }
+                if (bytesRead == expected) {
+                    position += bytesRead;
+                    Serial.printf("Downloaded chunk %d-%d, written %d bytes (%.1f%%)\n",
+                                  position - bytesRead, end, bytesRead, (position * 100.0) / totalSize);
                     Serial.printf("Free heap after chunk: %d bytes\n", ESP.getFreeHeap());
                     success = true;
                     break;
                 } else {
-                    Serial.printf("Write error or mismatch: expected %d, written %d\n", expected, bytesWritten);
+                    Serial.printf("Incomplete read: expected %d, read %d\n", expected, bytesRead);
                 }
             } else {
                 Serial.printf("HTTP error: %d for range %s\n", httpCode, range.c_str());
